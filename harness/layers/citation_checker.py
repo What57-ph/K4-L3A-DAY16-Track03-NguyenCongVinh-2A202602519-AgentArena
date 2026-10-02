@@ -62,13 +62,23 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _has_verbatim_line(doc, text: str) -> bool:
+    """Check the scorer's line-scoped quotation rule without editing text."""
+    return bool(
+        isinstance(text, str)
+        and text
+        and isinstance(getattr(doc, "body", None), str)
+        and any(text in line for line in doc.body.splitlines())
+    )
+
+
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
+        # Contract (§11): sửa doc_id theo dòng bằng chứng đã quan sát.
         #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
         #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
         #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
@@ -80,4 +90,29 @@ class CitationChecker(Middleware):
         #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
         #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
         #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or ctx.corpus is None:
+            return report
+        docs = tuple(ctx.corpus.docs)
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if not text:
+                continue
+            cited_id = claim.get("doc_id")
+            cited = ctx.corpus.get(cited_id) if isinstance(cited_id, str) else None
+            if cited is not None and _has_verbatim_line(cited, text):
+                continue
+            source = next((doc for doc in docs
+                           if (
+                               (doc.body and doc.body in ctx.observed_text)
+                               or (doc.doc_id and doc.doc_id in ctx.observed_text)
+                           )
+                           and _has_verbatim_line(doc, text)), None)
+            if source is not None:
+                claim["doc_id"] = source.doc_id
+        report["citations"] = sorted({claim.get("doc_id") for claim in claims
+                                       if isinstance(claim, dict)
+                                       and isinstance(claim.get("doc_id"), str)})
+        return report

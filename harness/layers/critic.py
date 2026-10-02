@@ -73,13 +73,50 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _has_verbatim_line(doc, text: str) -> bool:
+    """Return whether ``text`` is a substring of one document line.
+
+    The scorer deliberately scopes quotation support to a single line.  The
+    critic must use the same boundary when it repairs a fused claim; checking
+    ``text in doc.body`` would accidentally bless claims assembled across
+    lines.
+    """
+    return bool(
+        isinstance(text, str)
+        and text
+        and isinstance(getattr(doc, "body", None), str)
+        and any(text in line for line in doc.body.splitlines())
+    )
+
+
+def _was_observed(ctx, doc) -> bool:
+    """Whether the run exposed this document, by id or by full body."""
+    doc_id = getattr(doc, "doc_id", None)
+    body = getattr(doc, "body", None)
+    observed = ctx.observed_text
+    return bool(
+        (isinstance(doc_id, str) and doc_id and doc_id in observed)
+        or (isinstance(body, str) and body and body in observed)
+    )
+
+
+def _line_containing(doc, text: str) -> str | None:
+    """Return the document line containing a retained claim fragment."""
+    if not isinstance(text, str) or not text:
+        return None
+    body = getattr(doc, "body", None)
+    if not isinstance(body, str):
+        return None
+    return next((line for line in body.splitlines() if text in line), None)
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
+        # Contract (§2): lọc và tách claim theo bằng chứng quan sát được.
         #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
         #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
         #     -> giữ nguyên (KHÔNG sửa chữ).
@@ -91,4 +128,82 @@ class Critic(Middleware):
         #     claims = [], citations = [], và viết lại "answer" nói rõ là
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        docs = tuple(getattr(ctx.corpus, "docs", ()))
+        kept = []
+        answer_lines = []
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str):
+                continue
+            if ctx.saw(text):
+                # A visible quotation is not enough when its citation is
+                # fabricated or points at a document the run never saw.
+                # CitationChecker gets first chance to repair the doc_id;
+                # anything still invalid here must be removed rather than
+                # submitted as an auditable claim.
+                cited = None
+                cited_id = claim.get("doc_id")
+                if ctx.corpus is not None and isinstance(cited_id, str):
+                    cited = ctx.corpus.get(cited_id)
+                if ctx.corpus is None or (
+                    cited is not None and _was_observed(ctx, cited)
+                ):
+                    kept.append(claim)
+                continue
+            for index in range(len(text)):
+                if not text.startswith(" và ", index):
+                    continue
+                left, right = text[:index], text[index + len(" và "):]
+                left_docs = [
+                    d for d in docs
+                    if ctx.saw(left)
+                    and _has_verbatim_line(d, left)
+                    and _was_observed(ctx, d)
+                ]
+                right_docs = [
+                    d for d in docs
+                    if ctx.saw(right)
+                    and _has_verbatim_line(d, right)
+                    and _was_observed(ctx, d)
+                ]
+                pair = next(((a, b) for a in left_docs for b in right_docs
+                             if a.doc_id != b.doc_id), None)
+                if pair:
+                    kept.extend([{"text": left, "doc_id": pair[0].doc_id},
+                                 {"text": right, "doc_id": pair[1].doc_id}])
+                    for doc, fragment in (
+                        (pair[0], left),
+                        (pair[1], right),
+                    ):
+                        line = _line_containing(doc, fragment)
+                        if line and line not in answer_lines:
+                            answer_lines.append(line)
+                    report["abstain"] = True
+                    break
+            else:
+                continue
+
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời từ các tài liệu đã quan sát."
+        else:
+            report["citations"] = sorted({c.get("doc_id") for c in kept
+                                           if isinstance(c, dict)
+                                           and isinstance(c.get("doc_id"), str)
+                                           and c.get("doc_id")})
+            # The mock fuses contradictory spans and clips each side.  Keep
+            # the model-produced fragments as claims, but show the complete
+            # observed lines in the free-form answer so both policies remain
+            # understandable and the answer covers the cited evidence.
+            if answer_lines:
+                report["answer"] = (
+                    "Các tài liệu đã đọc nêu hai quy định khác nhau: "
+                    + " | ".join(answer_lines)
+                )
+        return report
